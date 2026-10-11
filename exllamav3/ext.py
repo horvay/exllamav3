@@ -26,7 +26,10 @@ def is_precompiled_extension_available():
         for suffix in importlib.machinery.EXTENSION_SUFFIXES
     )
 
-if is_precompiled_extension_available():
+if os.environ.get("EXL3_XPU") == "1":
+    # Intel XPU port: a Python shim (glm-b70 xpu/exllamav3_ext) stands in for the CUDA extension
+    import exllamav3_ext
+elif is_precompiled_extension_available():
     import exllamav3_ext
 else:
 

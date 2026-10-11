@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,6 +13,7 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 
+_ROW_CHUNK = int(os.environ.get("EXL3_MLP_ROW_CHUNK", "2048"))   # glm-b70: prefill row slice (GatedMLP.forward)
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
 class MLP(Module):
@@ -727,6 +729,18 @@ class GatedMLP(Module):
     ) -> torch.Tensor:
         bsz, q_len, dim = x.shape
 
+        # glm-b70: long prefill chunks run in row slices (rows are independent): the gate/up/activation
+        # intermediates otherwise peak at ~150 KB per token, which bounded the prompt chunk size
+        if bsz == 1 and q_len > _ROW_CHUNK > 0 and self.num_slices and not self.tp_reduce:
+            out = None
+            for r0 in range(0, q_len, _ROW_CHUNK):
+                y = self.forward(x[:, r0 : r0 + _ROW_CHUNK], params, out_dtype)
+                if out is None:
+                    out = torch.empty((1, q_len, y.shape[-1]), dtype = y.dtype, device = y.device)
+                out[:, r0 : r0 + y.shape[1]].copy_(y)
+                del y
+            return out
+
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
@@ -748,7 +762,9 @@ class GatedMLP(Module):
                     u = self.ups[s].forward(x, params)
                     a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
                     self.activation_fn_call(g, u, a, self.act_limit)
+                    del g, u                            # (glm-b70) not needed by the down projection
                     d_ = self.downs[s].forward(a, params)
+                    del a
 
                     if d is None: d = d_
                     else: d += d_

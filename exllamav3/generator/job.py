@@ -7,9 +7,12 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
+import os
 import random
 import time
 from ..ext import exllamav3_ext as ext
+
+_INPASS_CKPT = os.environ.get("EXL3_INPASS_CKPT", "1") == "1"
 from .loop_detect import LoopDetector
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
@@ -1304,10 +1307,16 @@ class Job:
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
             recurrent_last_page = False
+            inpass_ckpt = None
             if self.generator.recurrent_cache is not None:
                 seqlen = len(seq.sequence_ids) - 1
                 last_page_b = seqlen // PAGE_SIZE * PAGE_SIZE
-                if prefill_start < last_page_b <= prefill_end:
+                if prefill_start < last_page_b < prefill_end and _INPASS_CKPT and len(self.sequences) == 1 \
+                        and not self.embeddings and not self.generator.draft_model:
+                    # glm-b70: the recurrent layers stash the checkpoint state at last_page_b inside this forward
+                    # (GatedDeltaNet "recurrent_ckpt_offset") instead of a second forward for the last page
+                    inpass_ckpt = last_page_b
+                elif prefill_start < last_page_b <= prefill_end:
                     prefill_end = last_page_b
                     recurrent_last_page = True
                     prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
@@ -1388,6 +1397,9 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                if inpass_ckpt is not None:
+                    params["recurrent_ckpt_offset"] = inpass_ckpt - prefill_start
+                    params["recurrent_ckpt_side"] = {}
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:
@@ -1463,6 +1475,8 @@ class Job:
 
                 if recurrent_last_page:
                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+                elif inpass_ckpt is not None:
+                    self._put_inpass_checkpoint(inpass_ckpt, params["recurrent_ckpt_side"])
 
 
         if progress:
@@ -1618,6 +1632,25 @@ class Job:
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
+
+
+    def _put_inpass_checkpoint(self, pos: int, side: dict):
+        """glm-b70: store the checkpoint the recurrent layers stashed at `pos` during the last forward (what
+        maybe_stash_recurrent would store after a separate forward ending at pos)."""
+        rs = self.recurrent_state
+        layers = self.generator.cache.get_all_recurrent_layers()
+        if len(side) != len(layers) or self.last_recurrent_checkpoint_pos == pos:
+            return
+        seq = self.sequences[0]
+        page = seq.allocated_pages[(pos - 1) // PAGE_SIZE]
+        assert page.kv_position == PAGE_SIZE
+        stashed = {"position": pos, "checkpoint_size": rs.checkpoint_size, **side}
+
+        class _Stashed:
+            def stash(self):
+                return stashed
+        self.generator.recurrent_cache.put(page.phash, _Stashed())
+        self.last_recurrent_checkpoint_pos = pos
 
 
     def find_recurrent_stash(self, target_pos: int):

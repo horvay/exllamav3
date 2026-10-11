@@ -1003,6 +1003,11 @@ def dsa_attn(
         # halve the head tile (perf is irrelevant with asserts on)
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
+    if q.device.type == "xpu":
+        # Intel Xe2 (B70): the one-shot kernel's (32 x 512) fp32 accumulator with 3 stages does not fit the register
+        # file / SLM and the launch fails with UR_RESULT_ERROR_OUT_OF_RESOURCES (fatal, not a Triton OutOfResources)
+        num_stages = min(num_stages, int(os.environ.get("GLM_XPU_DSA_STAGES", "2")))
+        block_h = min(block_h, int(os.environ.get("GLM_XPU_DSA_BLOCK_H", "16")))
     if dsa_debug_bounds:
         pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
         dbg_pages = -(-pool_rows // max(page_size, 1))

@@ -242,7 +242,7 @@ def causal_conv1d_update_slotted_triton(
     transpose_output: bool = False,
     history: bool = False,
 ) -> torch.Tensor:
-    if not x.is_cuda:
+    if x.device.type not in ("cuda", "xpu"):
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
     if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
         raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous x, conv_state, and weight")

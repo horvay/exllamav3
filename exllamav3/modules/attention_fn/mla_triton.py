@@ -783,7 +783,8 @@ _mha_block_m = {}
 def _get_sm_count(device: torch.device) -> int:
     idx = device.index if hasattr(device, "index") else device
     if idx not in _sm_count:
-        _sm_count[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+        p = torch.cuda.get_device_properties(idx)
+        _sm_count[idx] = getattr(p, "multi_processor_count", None) or getattr(p, "gpu_subslice_count", None) or getattr(p, "max_compute_units", 256) // 8
     return _sm_count[idx]
 
 

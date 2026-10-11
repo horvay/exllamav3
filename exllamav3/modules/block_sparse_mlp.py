@@ -815,7 +815,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 optional = True,
                 allow_bf16 = True,
             )
-        if device is not None and torch.device(device).type == "cuda":
+        if device is not None and torch.device(device).type in ("cuda", "xpu"):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)

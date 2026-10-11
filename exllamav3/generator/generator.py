@@ -1119,7 +1119,7 @@ class Generator:
                 token_logits = batch_logits[a:b, :, :]
                 sampled = job.receive_logits(token_logits)
                 next_token = sampled[0]
-                if next_token.is_cuda and next_token.numel() == 1:
+                if next_token.device.type != "cpu" and next_token.numel() == 1:
                     k = len(launched)
                     pinned[k:k + 1].copy_(next_token.view(1, 1), non_blocking = True)
                     sampled = (pinned[k:k + 1],) + sampled[1:]

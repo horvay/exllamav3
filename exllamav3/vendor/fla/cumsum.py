@@ -179,6 +179,7 @@ def chunk_local_cumsum_vector(
     head_first: bool = False,
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
+    in_place: bool = False,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
@@ -190,7 +191,10 @@ def chunk_local_cumsum_vector(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    # in_place (glm-b70): each program loads its whole [BT, BS] block before storing it, so the output may alias the
+    # input; saves a (B, T, H, S) fp32 tensor per KDA prefill layer
+    same = in_place and g.dtype == (output_dtype or g.dtype)
+    g_org, g = g, (g if same else torch.empty_like(g, dtype=output_dtype or g.dtype))
     def grid(meta): return (triton.cdiv(meta['S'], meta['BS']), NT, B * H)
     # keep cummulative normalizer in fp32
     # this kernel is equivalent to
@@ -247,6 +251,7 @@ def chunk_local_cumsum(
             head_first=head_first,
             output_dtype=output_dtype,
             chunk_indices=chunk_indices,
+            in_place=kwargs.get("in_place", False),
         )
     else:
         raise ValueError(

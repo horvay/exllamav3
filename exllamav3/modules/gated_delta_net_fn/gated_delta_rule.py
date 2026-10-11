@@ -120,20 +120,30 @@ def gated_delta_rule_fn(
             recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
             if recurrent_slots_cpu is None:
                 recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+            from ...vendor.fla.l2norm import l2norm_fwd
+            def l2n(t):
+                # (glm-b70) the l2norm chunk_kda would apply, done here: q/k are strided views of mixed_qkv, and
+                # chunk_kda's input_guard would hold contiguous copies of them for the whole call next to the
+                # normalized ones. Same kernel, same values; the copy here is freed at once
+                t = t.contiguous()
+                return l2norm_fwd(t)[0]
             core_attn_out = []
             for i, s in enumerate(recurrent_slots_cpu.tolist()):
                 state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
                 core_attn, new_state = chunk_kda(
-                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                    l2n(q[i:i + 1]), l2n(k[i:i + 1]), v[i:i + 1],
                     g = g[i:i + 1],
                     beta = beta[i:i + 1],
                     initial_state = state,
                     output_final_state = save_state,
-                    use_qk_l2norm_in_kernel = True,
+                    use_qk_l2norm_in_kernel = False,
+                    g_in_place = True,      # g is this call's own (GatedDeltaNet.forward drops it after)
                 )
                 if save_state and state is not None:
                     state.copy_(new_state)
                 core_attn_out.append(core_attn)
+            if len(core_attn_out) == 1:
+                return core_attn_out[0].to(torch.bfloat16)
             return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
 
         core_attn_out = torch.empty(

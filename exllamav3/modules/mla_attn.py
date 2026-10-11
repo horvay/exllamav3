@@ -38,6 +38,9 @@ assert _score_tile % 256 == 0 and _score_tile > 0
 
 
 
+_MLA_SUB = int(os.environ.get("EXL3_MLA_SUBCHUNK", "1024"))   # glm-b70: prefill sub-chunk (MLAttention.forward)
+
+
 def _host_seqlens(params: dict, cache_seqlens: torch.Tensor) -> list:
     """Host copy of cache_seqlens, once per forward (shared across layers via the params
     dict). The generator supplies cache_seqlens as a host (pinned staging) tensor, in which
@@ -412,6 +415,32 @@ class MLAttention(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+        # glm-b70: long prefill chunks run as sequential sub-chunks of this layer alone (it attends causally to the
+        # cache, so this is the generator's chunking applied to one layer: same result, while every other module
+        # and the routed experts still see the whole chunk once). The sparse path holds ~200 KB per token of
+        # per-row tensors (q, q_lat, o_lat, unfolded o, indices), which bounded the prompt chunk size
+        cs = params.get("cache_seqlens")
+        if (_MLA_SUB > 0 and x.dim() == 3 and x.shape[0] == 1 and x.shape[1] > _MLA_SUB and self.num_q_heads
+                and params.get("cache") is not None and isinstance(cs, torch.Tensor) and cs.device.type == "cpu"
+                and params.get("non_causal_spans") is None and params.get("inv_freq") is None
+                and params.get("position_ids") is None
+                and (params.get("positions") is None or params["positions"].numel() == 1)):
+            seqlen = x.shape[1]
+            out = None
+            for a in range(0, seqlen, _MLA_SUB):
+                b = min(seqlen, a + _MLA_SUB)
+                p1 = {k: v for k, v in params.items()
+                      if k not in ("dev_cache", "_mla_host_seqlens", "dsa_topk_indices", "_as_dsa_indices")}
+                p1["cache_seqlens"] = cs + a
+                if params.get("positions") is not None:
+                    p1["positions"] = params["positions"] + a       # start position of the chunk
+                y = self.forward(x[:, a:b], p1, out_dtype)
+                if out is None:
+                    out = torch.empty((1, seqlen, y.shape[-1]), dtype = y.dtype, device = y.device)
+                out[:, a:b].copy_(y)
+                del y, p1
+            return out
+
         # TP rank without this layer: contribute nothing, stay in step with the collective
         if self.num_q_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
@@ -606,7 +635,9 @@ class MLAttention(Module):
             probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
             pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
             idx_layer.update_pool_direct(
-                torch.tensor([first_pool], dtype = torch.int32, device = plane.device),
+                # a fill kernel, not torch.tensor(..., device=): a pageable host-to-device copy waits for the whole
+                # queue (on XPU a full sync per completed pool, every index_kpool decode tokens per indexer layer)
+                torch.full((1,), first_pool, dtype = torch.int32, device = plane.device),
                 bt.unsqueeze(0) if bt.dim() == 1 else bt,
                 pool_keys.unsqueeze(0),
             )
@@ -888,6 +919,13 @@ class MLAttention(Module):
             # kernel's packed [nope | pe] per-head rows
             q = q.view(R, H, self.qk_head_dim)
             q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
+            if q.device.type == "xpu" and self.qk_rope_head_dim == 0 and qc is None:
+                # Intel XPU: oneDNN fused SDPA (glm-b70 xpu/glm_xpu/sparse_mla.py)
+                from glm_xpu.sparse_mla import mla_prefill_mha_sdpa
+                o = mla_prefill_mha_sdpa(q, self.w_uk_flat, self.w_uv_flat, ckv_cache, block_table, host_seqlens,
+                                         bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale)
+                o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+                return self.o_proj.forward(o, params)
             o = mla_attn_triton_prefill_mha(
                 q,
                 self.w_uk_flat, self.w_uv_flat,
@@ -948,6 +986,14 @@ class MLAttention(Module):
         # wise be the one sparse-path transient that grows with context (pages)
         bt = block_table if bsz == 1 or seqlen == 1 \
             else block_table.repeat_interleave(seqlen, dim = 0)
+        if q_lat.device.type == "xpu" and D_r == 0 and qc is None:
+            # Intel XPU: gathered oneDNN batched GEMMs (glm-b70 xpu/glm_xpu/sparse_mla.py); the Triton kernels run
+            # 5-22x slower on Xe2 and the one-shot variant can fail to launch
+            from glm_xpu.sparse_mla import sparse_mla_latent
+            o_lat = sparse_mla_latent(q_lat, ckv_cache, bt, indices, self.sm_scale)
+            o = mla_unfold(o_lat, self.w_uv_flat, self.v_head_dim)
+            o = o.reshape(bsz, seqlen, H * self.v_head_dim)
+            return self.o_proj.forward(o, params)
         o_lat = dsa_attn(
             q_lat, ckv_cache, kpe_cache, bt,
             indices = indices, k_len = indices.shape[1],

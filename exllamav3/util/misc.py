@@ -37,8 +37,9 @@ def cuda_sync_active():
     Calling torch.cuda.synchronize() will create a CUDA context on CUDA:0 even if that device is not being used.
     This function synchronizes only devices actively used by Torch in the current process.
     """
+    dtype = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() and not torch.version.cuda else "cuda"
     for device_id in range(torch.cuda.device_count()):
-        device = torch.device(f'cuda:{device_id}')
+        device = torch.device(f'{dtype}:{device_id}')
         if torch.cuda.memory_allocated(device) > 0:
             torch.cuda.synchronize(device)
 

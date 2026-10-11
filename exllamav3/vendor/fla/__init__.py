@@ -79,6 +79,7 @@ def chunk_kda(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 64,
+    g_in_place: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Chunked Kimi Delta Attention (per-channel decay) prefill.
@@ -102,16 +103,19 @@ def chunk_kda(
     if use_qk_l2norm_in_kernel:
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
-    g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
+    # g_in_place: the caller's g (fp32) is overwritten by its chunk-local cumsum (the caller does not reuse it)
+    g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2, in_place = g_in_place)
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q = q, k = k, v = v, gk = g, beta = beta, scale = scale, chunk_size = chunk_size,
     )
+    del k                                   # (glm-b70) prefill memory is per token: drop what is done with early
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k = kg, w = w, u = u, gk = g,
         initial_state = initial_state,
         output_final_state = output_final_state,
         chunk_size = chunk_size,
     )
+    del w, u, kg
     o = chunk_gla_fwd_o_gk(q = q, v = v_new, g = g, A = Aqk, h = h, scale = scale, chunk_size = chunk_size)
     return o.to(q.dtype), final_state
 

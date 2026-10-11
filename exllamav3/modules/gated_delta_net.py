@@ -30,6 +30,9 @@ from ..util import profile_opt
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
 
+_KDA_SUB = int(os.environ.get("EXL3_KDA_SUBCHUNK", "2048"))   # glm-b70: prefill split (GatedDeltaNet.forward)
+
+
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     """Split a batch of recurrent-layer states into per-device (conv_jobs, state_jobs) for the
     batched rewind kernels. With layer-split loading a single cache's GDN layers span multiple
@@ -40,7 +43,7 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     falls back to its own .rewind() call, unchanged."""
     jobs_by_device = {}
     for l in layers:
-        if isinstance(l, GDNLayerState):
+        if isinstance(l, GDNLayerState) and os.environ.get("EXL3_XPU") != "1":     # XPU: no batched rewind kernels
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -1023,6 +1026,35 @@ class GatedDeltaNet(Module):
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
+        # glm-b70: prompt checkpoint inside the pass (Job.prefill, "recurrent_ckpt_offset"): the layer runs its first c
+        # tokens, stashes its state for the checkpoint at that position, then runs the rest. The same split as the
+        # separate last-page forward the job would otherwise make (c is page-aligned, so KDA chunk boundaries match),
+        # without running every other module, and fetching every routed expert, a second time
+        # Long prompts split the same way every _KDA_SUB tokens (a multiple of the 64-token KDA chunk, so the
+        # result is unchanged): the layer's prefill activations (~200 KB per token) bounded the prompt chunk size
+        c = params.get("recurrent_ckpt_offset")
+        if rsg and not rsg[0].exported and bsz == 1 and not save_history and \
+                ((c and 0 < c < seqlen) or 0 < _KDA_SUB < seqlen):
+            cuts = set(range(_KDA_SUB, seqlen, _KDA_SUB)) if _KDA_SUB > 0 else set()
+            if c and 0 < c < seqlen:
+                cuts.add(c)
+            bounds = [0] + sorted(cuts) + [seqlen]
+            p1 = {k: v for k, v in params.items() if k != "recurrent_ckpt_offset"}
+            out = None
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                y = self.forward(x[:, a:b], p1, out_dtype)
+                if out is None:
+                    out = torch.empty((1, seqlen, y.shape[-1]), dtype = y.dtype, device = y.device)
+                out[:, a:b].copy_(y)
+                del y
+                if b == c:
+                    key = self.__dict__.get("_rs_key")
+                    if key is None:
+                        key = self._rs_key = next(k for k, l in rsg[0].cache.get_all_recurrent_layers().items()
+                                                  if l is rsl)
+                    params["recurrent_ckpt_side"][key] = rsl.stash(rsg[0].slot)
+            return out
+
         # Deferred fill of the merged b/a projection (weights are materialized by now)
         if self.bc_split and not self.ba_weight_filled and self.kda:
             self.dt_bias_bc.copy_(self.dt_bias)
@@ -1092,8 +1124,11 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
         elif self.kda:
+            # glm-b70: one transposing copy, and the projection (fp32) freed at once: prefill memory is per token
             qkv = self.qkv_proj.forward(x, params)
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            mixed_qkv = torch.empty((bsz, qkv.shape[-1], seqlen), dtype = torch.bfloat16, device = qkv.device)
+            mixed_qkv.copy_(qkv.transpose(1, 2))
+            del qkv
 
             # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
             z = self.g_b_proj.forward(self.g_a_proj.forward(x, params).to(torch.half), params) \
@@ -1104,14 +1139,17 @@ class GatedDeltaNet(Module):
 
             # Per-k-channel log decay from the low-rank forget gate: "safe gate" form when a
             # lower bound is configured, else softplus (per the Kimi/GLM5.3 reference)
+            # (glm-b70: computed in place, same values; the fp32 temporaries were held per token through the prefill)
             f = self.f_b_proj.forward(self.f_a_proj.forward(x, params).to(torch.half), params)
-            gf = (f.float() + self.dt_bias.float().view(1, 1, -1)) \
+            g = f.float() if f.dtype != torch.float else f
+            del f
+            g = g.add_(self.dt_bias.float().view(1, 1, -1)) \
                 .view(bsz, seqlen, self.num_v_heads, self.k_head_dim)
             decay = torch.exp(self.a_log.float()).view(1, 1, self.num_v_heads, 1)
             if self.gate_lower_bound is not None:
-                g = self.gate_lower_bound * torch.sigmoid(decay * gf)
+                g = g.mul_(decay).sigmoid_().mul_(self.gate_lower_bound)
             else:
-                g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
+                g = torch.nn.functional.softplus(g, beta = 1.0, threshold = 20.0).mul_(-decay)
         else:
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
@@ -1164,6 +1202,7 @@ class GatedDeltaNet(Module):
             params = params,
             channelwise_g = self.kda,
         )
+        del mixed_qkv, beta, g
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
